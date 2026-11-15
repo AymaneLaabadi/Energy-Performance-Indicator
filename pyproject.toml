@@ -1,0 +1,46 @@
+[project]
+name = "ipe-prediction"
+version = "0.1.0"
+description = "Predicting intrinsic building thermal indicators (HLC, Hb, time constants) from short indoor-temperature transients."
+readme = "README.md"
+authors = [
+    { name = "AymaneLaabadi", email = "aymanelaabadi01@gmail.com" }
+]
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "matplotlib>=3.11.2",
+    "numpy>=2.4.6",
+    "pandas>=3.1.1",
+    "torch>=2.11.0",
+]
+
+[project.scripts]
+ipe-prediction = "ipe_prediction:main"
+ipe-train = "ipe_prediction.training.train:main"
+ipe-evaluate = "ipe_prediction.training.evaluate:main"
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'win32' or sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# Loader provided by coEnergy, kept verbatim.
+extend-exclude = ["util_assessement.py", "src/ipe_prediction/util_assessement.py"]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+    "jupyter>=1.1.1",
+    "nbconvert>=7.17.2",
+    "ruff>=0.17.5",
+]
