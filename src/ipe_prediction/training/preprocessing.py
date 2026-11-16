@@ -1,11 +1,14 @@
-"""Input and target scaling, fitted on the training split only.
+"""Model inputs and target scaling, fitted on the training split only.
 
-* Input: ``delta_t / std(delta_t)``; the heater series stays binary (0/1).
-* Targets: the heat-loss coefficients (``HLC``, ``HLC_mit``, ``HLC_ext``) are standardised in
-  their natural scale (W/K); the time constants (``tau_b``, ``tau_n``, ``tau_inf``) are
-  log-transformed then standardised (they are strongly right-skewed, see the EDA).
+Inputs ``(B, C, L)``: ``delta_t / std(delta_t)`` and ``heater_on``. With ``extra_features``,
+three more channels: elapsed time ``t / L``, cumulative heating ``cumsum(heater_on) / L`` and the
+integral of the rise ``cumsum(delta_t / std) / L``. Integrated over ``[0, t]``, the lumped
+energy balance ``C dT = U dt - H T dt`` is linear in those channels.
 
-The scaler is an ``nn.Module`` holding its statistics as buffers, so it is saved with the model.
+Targets: ``HLC``, ``HLC_mit``, ``HLC_ext`` are standardised in W/K; the time constants are
+log-transformed (right-skewed) then standardised. Networks output 5 standardised values
+``[HLC_mit, HLC_ext, log tau_b, log tau_n, log tau_inf]``; ``HLC`` is always ``HLC_mit +
+HLC_ext``, so the additivity constraint holds by construction.
 """
 
 from __future__ import annotations
@@ -13,69 +16,72 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-
-def fit_delta_t_std(delta_t: torch.Tensor, indices: torch.Tensor, chunk: int = 50_000) -> float:
-    """Std of all ``delta_t`` values over the given rows, computed in chunks (float64)."""
-    s = s2 = 0.0
-    n = 0
-    for i in range(0, len(indices), chunk):
-        x = delta_t[indices[i : i + chunk]].double()
-        s += float(x.sum())
-        s2 += float(x.pow(2).sum())
-        n += x.numel()
-    mean = s / n
-    return (s2 / n - mean**2) ** 0.5
+#: Number of network outputs (all targets but HLC, which is their mit + ext sum).
+N_OUTPUTS: int = 5
+_LOG = torch.tensor([False, False, False, True, True, True])  # targets in log space
 
 
-class TargetScaler(nn.Module):
-    """Map between physical targets and the standardised space used by the network and loss.
+def n_inputs(extra_features: bool) -> int:
+    """Number of input channels built by :meth:`Preprocessor.inputs`."""
+    return 5 if extra_features else 2
 
-    Physical order (6): ``[HLC, HLC_mit, HLC_ext, tau_b, tau_n, tau_inf]``.
-    Network output order (5): ``[HLC_mit, HLC_ext, tau_b, tau_n, tau_inf]`` in standardised
-    space; ``HLC`` is not predicted but computed as ``HLC_mit + HLC_ext``.
-    """
 
-    def __init__(
-        self,
-        lin_mean: torch.Tensor,
-        lin_std: torch.Tensor,
-        log_mean: torch.Tensor,
-        log_std: torch.Tensor,
-    ) -> None:
+class Preprocessor(nn.Module):
+    """Scaling statistics (buffers, saved in the checkpoint) and the input / target transforms."""
+
+    def __init__(self, extra_features: bool = False) -> None:
         super().__init__()
-        self.register_buffer("lin_mean", lin_mean.float())  # HLC, HLC_mit, HLC_ext
-        self.register_buffer("lin_std", lin_std.float())
-        self.register_buffer("log_mean", log_mean.float())  # log tau_b, log tau_n, log tau_inf
-        self.register_buffer("log_std", log_std.float())
+        self.extra_features = extra_features
+        self.register_buffer("delta_t_std", torch.ones(()))
+        self.register_buffer("mean", torch.zeros(6))  # of the (log-)targets, canonical order
+        self.register_buffer("std", torch.ones(6))
+        self.register_buffer("log", _LOG.clone(), persistent=False)  # follows .to(device)
 
     @classmethod
-    def fit(cls, targets: torch.Tensor) -> TargetScaler:
-        """Fit the statistics on ``(N, 6)`` training targets."""
-        lin = targets[:, :3].double()
-        log = targets[:, 3:].double().log()
-        return cls(lin.mean(0), lin.std(0), log.mean(0), log.std(0))
+    def fit(
+        cls,
+        delta_t: torch.Tensor,
+        targets: torch.Tensor,
+        indices: torch.Tensor,
+        extra_features: bool = False,
+        chunk: int = 50_000,
+    ) -> Preprocessor:
+        """Fit on the rows ``indices`` (the training split); ``delta_t`` is read in chunks."""
+        prep = cls(extra_features)
+        s = s2 = n = 0.0
+        for i in range(0, len(indices), chunk):
+            x = delta_t[indices[i : i + chunk]].double()
+            s, s2, n = s + float(x.sum()), s2 + float(x.pow(2).sum()), n + x.numel()
+        prep.delta_t_std.fill_((s2 / n - (s / n) ** 2) ** 0.5)
+        y = prep._forward_transform(targets[indices].double())
+        prep.mean.copy_(y.mean(0))
+        prep.std.copy_(y.std(0))
+        return prep
 
-    @classmethod
-    def empty(cls) -> TargetScaler:
-        """Placeholder to be filled by ``load_state_dict``."""
-        return cls(torch.zeros(3), torch.ones(3), torch.zeros(3), torch.ones(3))
+    def inputs(self, delta_t: torch.Tensor, heater_on: torch.Tensor) -> torch.Tensor:
+        """``(B, L)`` rise in K and ``(B, L)`` heater state -> ``(B, C, L)`` network input."""
+        x = delta_t / self.delta_t_std
+        channels = [x, heater_on]
+        if self.extra_features:
+            length = x.shape[1]
+            t = torch.linspace(0.0, 1.0, length, device=x.device).expand_as(x)
+            channels += [t, heater_on.cumsum(1) / length, x.cumsum(1) / length]
+        return torch.stack(channels, dim=1)
+
+    def _forward_transform(self, y: torch.Tensor) -> torch.Tensor:
+        return torch.where(self.log, y.log(), y)
 
     def encode(self, y: torch.Tensor) -> torch.Tensor:
         """``(B, 6)`` physical targets -> ``(B, 6)`` standardised targets."""
-        z_lin = (y[:, :3] - self.lin_mean) / self.lin_std
-        z_log = (y[:, 3:].log() - self.log_mean) / self.log_std
-        return torch.cat([z_lin, z_log], dim=1)
+        return (self._forward_transform(y) - self.mean) / self.std
 
-    def outputs_to_standardized(self, out: torch.Tensor) -> torch.Tensor:
+    def standardized(self, out: torch.Tensor) -> torch.Tensor:
         """``(B, 5)`` network outputs -> ``(B, 6)`` standardised predictions (adds HLC)."""
-        mit = self.lin_mean[1] + self.lin_std[1] * out[:, 0]
-        ext = self.lin_mean[2] + self.lin_std[2] * out[:, 1]
-        z_hlc = (mit + ext - self.lin_mean[0]) / self.lin_std[0]
+        mit, ext = (self.mean[1:3] + self.std[1:3] * out[:, :2]).unbind(1)
+        z_hlc = (mit + ext - self.mean[0]) / self.std[0]
         return torch.cat([z_hlc[:, None], out], dim=1)
 
     def decode(self, out: torch.Tensor) -> torch.Tensor:
         """``(B, 5)`` network outputs -> ``(B, 6)`` physical predictions."""
-        mit = self.lin_mean[1] + self.lin_std[1] * out[:, 0]
-        ext = self.lin_mean[2] + self.lin_std[2] * out[:, 1]
-        taus = (self.log_mean + self.log_std * out[:, 2:]).exp()
-        return torch.cat([(mit + ext)[:, None], mit[:, None], ext[:, None], taus], dim=1)
+        y = self.mean + self.std * self.standardized(out)
+        return torch.where(self.log, y.exp(), y)

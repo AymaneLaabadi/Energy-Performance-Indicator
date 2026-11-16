@@ -17,7 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from ipe_prediction.data import (
     POWER_DECIMALS,
@@ -170,17 +170,13 @@ def _passthrough(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 def make_dataloader(
     dataset: ThermalDataset,
     batch_size: int,
-    shuffle: bool,
-    seed: int = 0,
-    num_workers: int = 0,
+    sampler: Sampler[int] | None = None,
 ) -> DataLoader[dict[str, torch.Tensor]]:
-    """``DataLoader`` with batched fetching and a seeded shuffle."""
+    """``DataLoader`` with batched fetching; in order unless a ``sampler`` (e.g. shuffling) is given."""
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        sampler=sampler,
         collate_fn=_passthrough,
-        num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
-        generator=torch.Generator().manual_seed(seed),
     )
