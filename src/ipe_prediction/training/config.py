@@ -7,12 +7,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ipe_prediction.data import TARGET_NAMES
 from ipe_prediction.training.models import MODELS
 
 
 @dataclass
 class DataConfig:
-    """Data location, frozen split and input options."""
+    """Data location, frozen split and input options (defaults = the final run)."""
 
     folder: str = "quentin_house"
     split_dir: str = "outputs/splits"
@@ -20,14 +21,21 @@ class DataConfig:
     split_fractions: tuple[float, float, float] = (0.8, 0.1, 0.1)
     #: Apply the assessment's rounding (0.01 degC, 0.1 W).
     quantize: bool = True
+    #: Targets to learn (canonical order). HLC is derived as HLC_mit + HLC_ext only when all
+    #: three are selected (see preprocessing); e.g. ("HLC_mit", "HLC_ext") learns those two.
+    targets: tuple[str, ...] = TARGET_NAMES
     #: Add the time / cumulative-heating / integrated-rise input channels (see preprocessing).
     extra_features: bool = False
     #: Std of Gaussian noise added to the training temperatures (K); 0 disables it.
     temperature_noise_std: float = 0.0
+    #: Keep only the simulations whose heating input has at least this duty cycle and this mean
+    #: step length in hours (train and validation splits); 0 disables each criterion.
+    min_duty_cycle: float = 0.0
+    min_step_hours: float = 0.0
     #: Random subset of the training split (quick runs); None = all of it.
     max_train: int | None = None
     #: Random subset of the validation split scored each epoch; None = all of it.
-    val_subset: int | None = 10_000
+    val_subset: int | None = 10000
 
     @property
     def split_path(self) -> Path:
@@ -36,19 +44,31 @@ class DataConfig:
 
 @dataclass
 class TrainConfig:
-    """AdamW with linear warmup then cosine decay (per batch) down to ``min_lr``."""
+    """AdamW with a per-batch learning-rate schedule (``lr_schedule``); defaults = the final run.
 
-    epochs: int = 60
+    * ``"cosine"``: linear ramp to ``lr`` over ``warmup_epochs``, then cosine decay to ``min_lr``
+      at the last epoch (so ``epochs`` is the real training budget);
+    * ``"step"``: ``lr`` for the first ``warmup_epochs``, then ``min_lr`` (fixed) until the end.
+    """
+
+    epochs: int = 30
     batch_size: int = 512
     eval_batch_size: int = 1024
+    lr_schedule: str = "cosine"
     lr: float = 1e-3
-    min_lr: float = 1e-6
+    min_lr: float = 1e-5
     warmup_epochs: float = 1.0
-    weight_decay: float = 1e-4
+    weight_decay: float = 0
+    #: "mse", or "gaussian_nll" (beta-NLL: the network also predicts a variance per target;
+    #: the validation loss stays the standardised MSE of the means).
+    loss: str = "mse"
     grad_clip: float = 1.0
+    #: Training batches used to recompute the BatchNorm statistics before each validation
+    #: (precise BN, see engine.recalibrate_batchnorm); 0 disables it.
+    bn_recalibration_batches: int = 100
     #: Mixed precision on CUDA: bf16 on Ampere+ GPUs, fp16 with gradient scaling otherwise.
     amp: bool = True
-    seed: int = 0
+    seed: int = 42
     device: str = "cuda"
 
 

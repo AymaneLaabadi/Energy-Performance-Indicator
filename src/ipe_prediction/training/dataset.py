@@ -123,6 +123,24 @@ def prepare_data(cfg: DataConfig) -> tuple[SimulationTensors, dict[str, torch.Te
     return tensors, split
 
 
+def excitation_mask(
+    heater_on: torch.Tensor, min_duty_cycle: float, min_step_hours: float, chunk: int = 100_000
+) -> torch.Tensor:
+    """Simulations whose heating input passes the filter ``(N,)`` bool (input-only criteria).
+
+    * duty cycle: share of time with the heater on;
+    * mean step: series duration divided by the number of constant on/off blocks (8 h for a
+      constant input).
+    """
+    keep = []
+    for block in heater_on.split(chunk):
+        u = block.float()
+        hours = u.shape[1] / 60
+        mean_step = hours / (u.diff(dim=1).abs().sum(1) + 1)
+        keep.append((u.mean(1) >= min_duty_cycle) & (mean_step >= min_step_hours))
+    return torch.cat(keep)
+
+
 class ThermalDataset(Dataset[dict[str, torch.Tensor]]):
     """Dataset over a subset (``indices``) of :class:`SimulationTensors`.
 

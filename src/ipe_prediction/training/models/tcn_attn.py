@@ -83,7 +83,9 @@ class TCNAttention(nn.Module):
     Strided stem conv (480 -> 240 steps), residual dilated blocks, attention pooling, MLP head.
     """
 
-    def __init__(self, cfg: TCNAttentionConfig, in_channels: int) -> None:
+    def __init__(
+        self, cfg: TCNAttentionConfig, in_channels: int, n_outputs: int = N_OUTPUTS
+    ) -> None:
         super().__init__()
         c, s = cfg.channels, cfg.stem_stride
         self.stem = nn.Conv1d(in_channels, c, kernel_size=2 * s + 1, stride=s, padding=s)
@@ -97,7 +99,7 @@ class TCNAttention(nn.Module):
             nn.Linear(c, cfg.mlp_hidden),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
-            nn.Linear(cfg.mlp_hidden, N_OUTPUTS),
+            nn.Linear(cfg.mlp_hidden, n_outputs),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

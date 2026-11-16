@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import pandas as pd
 import torch
 
 from ipe_prediction.data import TARGET_FAMILIES, TARGET_NAMES, TARGET_UNITS
 
 
-def per_target_metrics(y_pred: torch.Tensor, y_true: torch.Tensor) -> pd.DataFrame:
-    """Regression metrics for each of the 6 targets.
+def per_target_metrics(
+    y_pred: torch.Tensor, y_true: torch.Tensor, names: Sequence[str] = TARGET_NAMES
+) -> pd.DataFrame:
+    """Regression metrics for each target (columns of ``y_pred`` / ``y_true``, named ``names``).
 
     Columns:
         ``unit``; ``MAE``, ``RMSE``, ``bias`` (mean of pred - true) and ``P95_AE`` (95th percentile of
@@ -29,27 +33,33 @@ def per_target_metrics(y_pred: torch.Tensor, y_true: torch.Tensor) -> pd.DataFra
             "P95_APE_%": rel_err.quantile(0.95, dim=0).numpy(),
             "R2": (1 - err.pow(2).sum(0) / sst).numpy(),
         },
-        index=list(TARGET_NAMES),
+        index=list(names),
     )
-    table.insert(0, "unit", [TARGET_UNITS[n] for n in TARGET_NAMES])
+    table.insert(0, "unit", [TARGET_UNITS[n] for n in names])
     return table
 
 
 def per_family_metrics(table: pd.DataFrame) -> pd.DataFrame:
-    """Average the relative metrics of :func:`per_target_metrics` within each family."""
+    """Average the relative metrics of :func:`per_target_metrics` within each family present."""
     rows = {
-        family: table.loc[list(names), ["MAPE_%", "P95_APE_%", "R2"]].mean()
+        family: table.loc[present, ["MAPE_%", "P95_APE_%", "R2"]].mean()
         for family, names in TARGET_FAMILIES.items()
+        if (present := [n for n in names if n in table.index])
     }
     return pd.DataFrame(rows).T
 
 
-def constraint_report(y_pred: torch.Tensor) -> dict[str, float]:
-    """Check the physical constraints on predictions (should hold by construction)."""
-    hlc, mit, ext, tau_b, tau_n, tau_inf = y_pred.double().cpu().unbind(1)
-    return {
-        "max_abs_HLC_minus_sum_W_per_K": float((hlc - mit - ext).abs().max()),
-        "share_tau_n_le_tau_inf": float((tau_n <= tau_inf).double().mean()),
-        "share_tau_inf_le_tau_b": float((tau_inf <= tau_b).double().mean()),
-        "share_all_positive": float((y_pred > 0).all(1).double().mean()),
-    }
+def constraint_report(
+    y_pred: torch.Tensor, names: Sequence[str] = TARGET_NAMES
+) -> dict[str, float]:
+    """Check the physical constraints that apply to the predicted targets."""
+    y = dict(zip(names, y_pred.double().cpu().unbind(1), strict=True))
+    report = {"share_all_positive": float((y_pred > 0).all(1).double().mean())}
+    if {"HLC", "HLC_mit", "HLC_ext"} <= y.keys():
+        gap = (y["HLC"] - y["HLC_mit"] - y["HLC_ext"]).abs().max()
+        report["max_abs_HLC_minus_sum_W_per_K"] = float(gap)
+    if {"tau_n", "tau_inf"} <= y.keys():
+        report["share_tau_n_le_tau_inf"] = float((y["tau_n"] <= y["tau_inf"]).double().mean())
+    if {"tau_inf", "tau_b"} <= y.keys():
+        report["share_tau_inf_le_tau_b"] = float((y["tau_inf"] <= y["tau_b"]).double().mean())
+    return report

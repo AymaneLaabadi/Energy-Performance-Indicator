@@ -14,12 +14,12 @@ from ipe_prediction.training.preprocessing import N_OUTPUTS
 class CNNGRUConfig:
     """Hyper-parameters of :class:`CNNGRU` (one entry per conv layer in the ``conv_*`` tuples)."""
 
-    conv_channels: tuple[int, ...] = (32, 64, 64)
-    conv_kernels: tuple[int, ...] = (5, 5, 5)
-    conv_strides: tuple[int, ...] = (2, 2, 2)
+    conv_channels: tuple[int, ...] = (32, 64)
+    conv_kernels: tuple[int, ...] = (5, 5)
+    conv_strides: tuple[int, ...] = (2, 2)
     gru_hidden: int = 32
-    gru_layers: int = 2
-    mlp_hidden: int = 64
+    gru_layers: int = 1
+    mlp_hidden: int = 32
 
 
 class CNNGRU(nn.Module):
@@ -29,7 +29,7 @@ class CNNGRU(nn.Module):
     on the final forward and backward states of the top layer.
     """
 
-    def __init__(self, cfg: CNNGRUConfig, in_channels: int) -> None:
+    def __init__(self, cfg: CNNGRUConfig, in_channels: int, n_outputs: int = N_OUTPUTS) -> None:
         super().__init__()
         layers, c_in = [], in_channels
         for c_out, k, s in zip(cfg.conv_channels, cfg.conv_kernels, cfg.conv_strides, strict=True):
@@ -42,7 +42,7 @@ class CNNGRU(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(2 * cfg.gru_hidden, cfg.mlp_hidden),
             nn.GELU(),
-            nn.Linear(cfg.mlp_hidden, N_OUTPUTS),
+            nn.Linear(cfg.mlp_hidden, n_outputs),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

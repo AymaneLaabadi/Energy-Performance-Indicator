@@ -32,10 +32,18 @@ from ipe_prediction.training.config import DataConfig, ExperimentConfig, TrainCo
 from ipe_prediction.training.dataset import (
     SimulationTensors,
     ThermalDataset,
+    excitation_mask,
     make_dataloader,
     prepare_data,
 )
-from ipe_prediction.training.engine import amp_dtype, evaluate, train_one_epoch, warmup_cosine
+from ipe_prediction.training.engine import (
+    amp_dtype,
+    evaluate,
+    lr_scheduler,
+    recalibrate_batchnorm,
+    train_one_epoch,
+)
+from ipe_prediction.training.losses import LOSSES, n_network_outputs
 from ipe_prediction.training.metrics import constraint_report, per_family_metrics
 from ipe_prediction.training.models import MODELS, build_model, count_parameters
 from ipe_prediction.training.preprocessing import Preprocessor, n_inputs
@@ -90,22 +98,39 @@ def _train(cfg: ExperimentConfig, model: nn.Module | None, resume: bool, data: D
 
     # --- data (seeded subsets: a resumed run sees the same simulations)
     tensors, split = data if data is not None else prepare_data(cfg.data)
-    train_idx = subset(split["train"], cfg.data.max_train, tc.seed)
-    val_idx = subset(split["val"], cfg.data.val_subset, tc.seed + 1)
-    prep = Preprocessor.fit(tensors.delta_t, tensors.targets, train_idx, cfg.data.extra_features)
-    prep = prep.to(device)
+    train_idx, val_idx = split["train"], split["val"]
+    if cfg.data.min_duty_cycle > 0 or cfg.data.min_step_hours > 0:  # input-based filter
+        keep = excitation_mask(tensors.heater_on, cfg.data.min_duty_cycle, cfg.data.min_step_hours)
+        train_idx, val_idx = train_idx[keep[train_idx]], val_idx[keep[val_idx]]
+        logger.info(
+            "excitation filter (duty >= %g, mean step >= %g h): %d train, %d val simulations",
+            cfg.data.min_duty_cycle, cfg.data.min_step_hours, len(train_idx), len(val_idx),
+        )  # fmt: skip
+    train_idx = subset(train_idx, cfg.data.max_train, tc.seed)
+    val_idx = subset(val_idx, cfg.data.val_subset, tc.seed + 1)
+    prep = Preprocessor.fit(
+        tensors.delta_t, tensors.targets, train_idx, cfg.data.extra_features, cfg.data.targets
+    ).to(device)
+    names = prep.target_names
     train_set = ThermalDataset(tensors, train_idx, cfg.data.temperature_noise_std)
     train_loader = make_dataloader(train_set, tc.batch_size, shuffle=True, seed=tc.seed)
+    bn_loader = make_dataloader(train_set, tc.batch_size, shuffle=True, seed=tc.seed + 1)
     val_loader = make_dataloader(ThermalDataset(tensors, val_idx), tc.eval_batch_size)
 
     # --- model and optimisation
     if model is None:
-        model = build_model(cfg.model, cfg.model_config, n_inputs(cfg.data.extra_features))
+        in_channels = n_inputs(cfg.data.extra_features)
+        n_out = n_network_outputs(prep, tc.loss)
+        model = build_model(cfg.model, cfg.model_config, in_channels, n_out)
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=tc.lr, weight_decay=tc.weight_decay)
     steps = len(train_loader)
-    scheduler = warmup_cosine(
-        optimizer, tc.epochs * steps, round(tc.warmup_epochs * steps), tc.min_lr / tc.lr
+    scheduler = lr_scheduler(
+        optimizer,
+        tc.lr_schedule,
+        tc.epochs * steps,
+        round(tc.warmup_epochs * steps),
+        tc.min_lr / tc.lr,
     )
     dtype = amp_dtype(device, tc.amp)
     grad_scaler = torch.amp.GradScaler("cuda", enabled=dtype == torch.float16)
@@ -127,15 +152,19 @@ def _train(cfg: ExperimentConfig, model: nn.Module | None, resume: bool, data: D
         (run_dir / "model.txt").write_text(str(model))
 
     logger.info(
-        "%s: %s parameters | train %d | val %d | batch %d | %s | lr %.1e, warmup %.1f epochs",
+        "%s: %s parameters | train %d | val %d | batch %d | %s | lr %s %.1e -> %.1e after %.1f "
+        "epochs | weight decay %g",
         cfg.model,
         f"{count_parameters(model):,}",
         len(train_idx),
         len(val_idx),
         tc.batch_size,
         str(dtype).replace("torch.", "autocast ") if dtype else "float32",
+        tc.lr_schedule,
         tc.lr,
+        tc.min_lr,
         tc.warmup_epochs,
+        tc.weight_decay,
     )
 
     # --- epochs
@@ -144,9 +173,11 @@ def _train(cfg: ExperimentConfig, model: nn.Module | None, resume: bool, data: D
         train_loader.generator.manual_seed(tc.seed * 100_003 + epoch)  # same order when resuming
         train_loss = train_one_epoch(
             model, prep, train_loader, optimizer, scheduler, grad_scaler, device, dtype,
-            tc.grad_clip,
+            tc.grad_clip, tc.loss,
         )  # fmt: skip
-        val = evaluate(model, prep, val_loader, device, dtype)
+        bn_loader.generator.manual_seed(tc.seed * 100_003 + epoch + 1)
+        recalibrate_batchnorm(model, prep, bn_loader, device, dtype, tc.bn_recalibration_batches)
+        val = evaluate(model, prep, val_loader, device, dtype, tc.loss)
         row = {
             "epoch": epoch,
             "train_loss": train_loss,
@@ -155,9 +186,9 @@ def _train(cfg: ExperimentConfig, model: nn.Module | None, resume: bool, data: D
             "lr": optimizer.param_groups[0]["lr"],
             **{
                 f"val_loss_{n}": float(v)
-                for n, v in zip(TARGET_NAMES, val["loss_per_target"], strict=True)
+                for n, v in zip(names, val["loss_per_target"], strict=True)
             },
-            **{f"val_MAPE_{n}": float(val["metrics"].loc[n, "MAPE_%"]) for n in TARGET_NAMES},
+            **{f"val_MAPE_{n}": float(val["metrics"].loc[n, "MAPE_%"]) for n in names},
         }
         history.append(row)
         logger.info(
@@ -165,7 +196,7 @@ def _train(cfg: ExperimentConfig, model: nn.Module | None, resume: bool, data: D
             epoch,
             train_loss,
             val["loss"],
-            " ".join(f"{n}={row[f'val_MAPE_{n}']:.2f}" for n in TARGET_NAMES),
+            " ".join(f"{n}={row[f'val_MAPE_{n}']:.2f}" for n in names),
             row["seconds"],
             row["lr"],
         )
@@ -192,13 +223,13 @@ def _train(cfg: ExperimentConfig, model: nn.Module | None, resume: bool, data: D
 
     # --- final validation of the best epoch
     model.load_state_dict(torch.load(run_dir / "best.pt", weights_only=True)["model"])
-    val = evaluate(model, prep, val_loader, device, dtype)
+    val = evaluate(model, prep, val_loader, device, dtype, tc.loss)
     val["metrics"].to_csv(run_dir / "metrics_val.csv")
     summary = {
         "best_epoch": best_epoch,
         "val_loss": val["loss"],
         "val_family": per_family_metrics(val["metrics"]).round(4).to_dict(orient="index"),
-        "val_constraints": constraint_report(val["pred"]),
+        "val_constraints": constraint_report(val["pred"], names),
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     logger.info(
@@ -216,8 +247,24 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[ExperimentConfig, boo
     p.add_argument("--resume", action="store_true", help="continue run <name> from last.pt")
     p.add_argument("--epochs", type=int, default=t.epochs)
     p.add_argument("--batch-size", type=int, default=t.batch_size)
-    p.add_argument("--lr", type=float, default=t.lr)
+    p.add_argument("--lr-schedule", choices=["step", "cosine"], default=t.lr_schedule)
+    p.add_argument("--lr", type=float, default=t.lr, help="lr of the first warmup epochs")
+    p.add_argument("--min-lr", type=float, default=t.min_lr, help="lr after the warmup (step)")
+    p.add_argument("--warmup-epochs", type=float, default=t.warmup_epochs)
+    p.add_argument("--weight-decay", type=float, default=t.weight_decay)
+    p.add_argument(
+        "--loss", choices=LOSSES, default=t.loss, help="gaussian_nll: also predict a variance"
+    )
     p.add_argument("--max-train", type=int, help="subsample the training split (quick runs)")
+    p.add_argument("--min-duty-cycle", type=float, default=0.0, help="input filter (0 = off)")
+    p.add_argument("--min-step-hours", type=float, default=0.0, help="input filter (0 = off)")
+    p.add_argument(
+        "--targets",
+        nargs="+",
+        choices=TARGET_NAMES,
+        default=list(TARGET_NAMES),
+        help="targets to learn (HLC = mit + ext only when all three are given)",
+    )
     p.add_argument("--extra-features", action="store_true", help="5 input channels instead of 2")
     p.add_argument("--no-amp", dest="amp", action="store_false", help="train in float32")
     a = p.parse_args(argv)
@@ -227,8 +274,24 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[ExperimentConfig, boo
     cfg = ExperimentConfig(
         name=a.name,
         model=a.model,
-        data=DataConfig(max_train=a.max_train, extra_features=a.extra_features),
-        train=TrainConfig(epochs=a.epochs, batch_size=a.batch_size, lr=a.lr, amp=a.amp),
+        data=DataConfig(
+            max_train=a.max_train,
+            extra_features=a.extra_features,
+            targets=tuple(a.targets),
+            min_duty_cycle=a.min_duty_cycle,
+            min_step_hours=a.min_step_hours,
+        ),
+        train=TrainConfig(
+            epochs=a.epochs,
+            batch_size=a.batch_size,
+            lr_schedule=a.lr_schedule,
+            lr=a.lr,
+            min_lr=a.min_lr,
+            warmup_epochs=a.warmup_epochs,
+            weight_decay=a.weight_decay,
+            loss=a.loss,
+            amp=a.amp,
+        ),
     )
     return cfg, False
 

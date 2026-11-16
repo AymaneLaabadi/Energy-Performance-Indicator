@@ -37,11 +37,12 @@ def evaluate_run(run_dir: Path, split_name: str) -> None:
 
     tensors, split = prepare_data(cfg.data)
     loader = make_dataloader(ThermalDataset(tensors, split[split_name]), cfg.train.eval_batch_size)
-    res = evaluate(model, prep, loader, device, amp_dtype(device, cfg.train.amp))
+    res = evaluate(model, prep, loader, device, amp_dtype(device, cfg.train.amp), cfg.train.loss)
 
     res["metrics"].to_csv(run_dir / f"metrics_{split_name}.csv")
     torch.save(
-        {k: res[k] for k in ("pred", "target", "index")}
+        {k: res[k] for k in ("pred", "target", "index", "pred_std_z") if k in res}
+        | {"target_names": prep.target_names}
         | {"excitation": tensors.excitation[res["index"]], "names": tensors.excitation_names},
         run_dir / f"predictions_{split_name}.pt",
     )
@@ -49,7 +50,7 @@ def evaluate_run(run_dir: Path, split_name: str) -> None:
         "split": split_name,
         "loss": res["loss"],
         "family": per_family_metrics(res["metrics"]).round(4).to_dict(orient="index"),
-        "constraints": constraint_report(res["pred"]),
+        "constraints": constraint_report(res["pred"], prep.target_names),
     }
     (run_dir / f"summary_{split_name}.json").write_text(json.dumps(summary, indent=2))
     logger.info("%s metrics:\n%s", split_name, res["metrics"].round(3).to_string())
