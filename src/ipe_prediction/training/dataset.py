@@ -170,17 +170,15 @@ def _passthrough(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 def make_dataloader(
     dataset: ThermalDataset,
     batch_size: int,
-    shuffle: bool,
+    shuffle: bool = False,
     seed: int = 0,
-    num_workers: int = 0,
 ) -> DataLoader[dict[str, torch.Tensor]]:
-    """``DataLoader`` with batched fetching and a seeded shuffle."""
+    """``DataLoader`` with batched fetching and a seeded shuffle (``loader.generator``)."""
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=_passthrough,
-        num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
         generator=torch.Generator().manual_seed(seed),
     )

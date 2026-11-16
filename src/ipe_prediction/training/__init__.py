@@ -1,1 +1,1 @@
-"""Training pipeline: data loading, splits, scaling, models, losses, metrics, train / evaluate."""
+"""Training pipeline: data, splits, preprocessing, models, loss, metrics, train and evaluate."""
