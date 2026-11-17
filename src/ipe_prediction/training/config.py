@@ -36,6 +36,10 @@ class DataConfig:
     max_train: int | None = None
     #: Random subset of the validation split scored each epoch; None = all of it.
     val_subset: int | None = 10000
+    #: Random subset of the training split also scored each epoch, in evaluation mode like the
+    #: validation (the running training loss mixes dropout and changing weights): the gap
+    #: between the two measures the overfitting. 0 disables it.
+    train_eval_subset: int = 0
 
     @property
     def split_path(self) -> Path:
@@ -48,7 +52,12 @@ class TrainConfig:
 
     * ``"cosine"``: linear ramp to ``lr`` over ``warmup_epochs``, then cosine decay to ``min_lr``
       at the last epoch (so ``epochs`` is the real training budget);
-    * ``"step"``: ``lr`` for the first ``warmup_epochs``, then ``min_lr`` (fixed) until the end.
+    * ``"step"``: ``lr`` for the first ``warmup_epochs``, then ``min_lr`` (fixed) until the end;
+    * ``"constant"``: linear ramp to ``lr`` over ``warmup_epochs``, then ``lr`` until the end;
+    * ``"cosine_restarts"``: linear ramp, then cosine cycles of ``restart_epochs`` epochs from
+      ``lr`` down to ``min_lr``, restarting at ``lr`` (SGDR). The lr never goes to zero and each
+      restart pushes the weights out of a plateau: the schedule for very long runs (hundreds of
+      epochs) whose number of epochs is not fixed in advance.
     """
 
     epochs: int = 30
@@ -58,6 +67,8 @@ class TrainConfig:
     lr: float = 1e-3
     min_lr: float = 1e-5
     warmup_epochs: float = 1.0
+    #: Length of one cosine cycle in epochs (``cosine_restarts`` only).
+    restart_epochs: float = 50.0
     weight_decay: float = 0
     #: "mse", or "gaussian_nll" (beta-NLL: the network also predicts a variance per target;
     #: the validation loss stays the standardised MSE of the means).

@@ -17,7 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from ipe_prediction.data import (
     POWER_DECIMALS,
@@ -190,12 +190,17 @@ def make_dataloader(
     batch_size: int,
     shuffle: bool = False,
     seed: int = 0,
+    sampler: Sampler[int] | None = None,
 ) -> DataLoader[dict[str, torch.Tensor]]:
-    """``DataLoader`` with batched fetching and a seeded shuffle (``loader.generator``)."""
+    """``DataLoader`` with batched fetching and a seeded shuffle (``loader.generator``).
+
+    A ``sampler`` (e.g. ``DistributedSampler``, one shard per GPU) replaces ``shuffle``.
+    """
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle and sampler is None,
+        sampler=sampler,
         collate_fn=_passthrough,
         pin_memory=torch.cuda.is_available(),
         generator=torch.Generator().manual_seed(seed),

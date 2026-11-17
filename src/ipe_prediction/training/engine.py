@@ -25,28 +25,43 @@ def amp_dtype(device: torch.device, enabled: bool) -> torch.dtype | None:
     return torch.bfloat16 if torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
 
 
+LR_SCHEDULES = ("cosine", "step", "constant", "cosine_restarts")
+
+
 def lr_scheduler(
     optimizer: torch.optim.Optimizer,
     schedule: str,
     total_steps: int,
     warmup_steps: int,
     min_ratio: float,
+    cycle_steps: int = 0,
 ) -> torch.optim.lr_scheduler.LambdaLR:
     """Per-step schedule, as a factor of the optimizer's base lr (see ``TrainConfig``).
 
     * ``"step"``: 1 for the first ``warmup_steps``, then ``min_ratio`` until the end;
-    * ``"cosine"``: linear ramp to 1 over ``warmup_steps``, then cosine decay to ``min_ratio``.
+    * ``"cosine"``: linear ramp to 1 over ``warmup_steps``, then cosine decay to ``min_ratio``;
+    * ``"constant"``: linear ramp to 1 over ``warmup_steps``, then 1;
+    * ``"cosine_restarts"``: linear ramp, then cosine cycles of ``cycle_steps`` from 1 down to
+      ``min_ratio``, each restarting at 1.
     """
-    if schedule not in ("step", "cosine"):
-        raise ValueError(f"lr_schedule must be 'step' or 'cosine', got {schedule!r}")
+    if schedule not in LR_SCHEDULES:
+        raise ValueError(f"lr_schedule must be one of {LR_SCHEDULES}, got {schedule!r}")
+    if schedule == "cosine_restarts" and cycle_steps < 1:
+        raise ValueError("cosine_restarts needs cycle_steps >= 1")
+
+    def cosine(progress: float) -> float:
+        return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
 
     def factor(step: int) -> float:
         if schedule == "step":
             return 1.0 if step < warmup_steps else min_ratio
         if step < warmup_steps:
             return (step + 1) / warmup_steps
-        progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
-        return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+        if schedule == "constant":
+            return 1.0
+        if schedule == "cosine_restarts":
+            return cosine(((step - warmup_steps) % cycle_steps) / cycle_steps)
+        return cosine(min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps)))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
 

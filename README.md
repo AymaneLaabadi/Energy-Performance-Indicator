@@ -119,7 +119,8 @@ Training options: `uv run ipe-train --help` (`--model`, `--epochs`, `--lr`, `--l
 * `main`: the simple single-GPU pipeline.
 * `model-a`: this work (Model A, targets selection, beta-NLL, input filter, analysis notebooks).
 * `sysid-hybrid`: system-identification features + TCN hybrid (tested, no gain; notebook in report).
-* `kaggle-ddp`: multi-GPU training (DistributedDataParallel) for the Kaggle T4 x2 accelerator.
+* `kaggle-ddp`: `main` + multi-GPU training (DistributedDataParallel, Kaggle T4 x2), learning-rate
+  restarts and the overfitting run (below).
 
 ## Training on Kaggle (free GPU)
 
@@ -136,3 +137,38 @@ import glob
 %run {glob.glob("/kaggle/input/**/kaggle_setup.py", recursive=True)[0]}
 !python -m ipe_prediction.training.train --name final_tcn_mse
 ```
+
+### Both GPUs (T4 x2) and the overfitting run
+
+`--ddp` starts one process per GPU (DistributedDataParallel). `--batch-size` stays the global
+batch (256 per GPU with the default 512); every process scores the validation set, process 0 logs
+and saves. A run can be resumed with or without `--ddp`.
+
+Goal of this run: find how far the best model (`tcn_attn`) can **fit the 800k training
+simulations**, generalisation being only measured, not sought. `final_tcn_mse` ends with a
+training loss equal to its validation loss (0.739 vs 0.737): it underfits, so the run removes
+every regulariser and trains for hundreds of epochs without ever annealing the learning rate:
+
+```python
+!python -m ipe_prediction.training.train --name overfit_tcn --ddp --epochs 300 \
+    --lr-schedule cosine_restarts --lr 1e-3 --min-lr 1e-4 --restart-epochs 50 \
+    --weight-decay 0 --val-subset 0 --train-eval-subset 100000 \
+    --model-set dropout=0 mlp_hidden=256
+# next Kaggle session (previous output as input): extend the same run
+!python -m ipe_prediction.training.train --name overfit_tcn --ddp --resume --epochs 700
+```
+
+* `cosine_restarts` (SGDR): cosine cycles of 50 epochs from 1e-3 down to 1e-4, then back to 1e-3.
+  The lr never goes below 10 % of its peak, and each restart kicks the weights out of a plateau;
+  its shape does not depend on `--epochs`, so the run can be extended with `--resume --epochs N`
+  (also true of `constant`). No early stopping, no reduce-on-plateau.
+* `dropout=0`, `--weight-decay 0`: no regularisation; wider head (`mlp_hidden=256`). The width
+  of the TCN (`channels=64`) can be raised with `--model-set channels=96`, at ~2x the time per epoch.
+* `--val-subset 0`: the whole validation split (100k) each epoch; the test split (100k) stays
+  untouched until `ipe-evaluate --split test`.
+* `--train-eval-subset 100000`: 100k training simulations also scored each epoch in evaluation
+  mode; the gap with the validation is the overfitting. Each epoch logs the loss, MAPE and **R2
+  of every output** on the validation (and the training R2 on the next line); `history.csv`
+  keeps them all, `summary.json` compares the last and the best epochs.
+* A Kaggle session stops after 12 h: train in chunks (`--epochs` then `--resume --epochs`)
+  sized from the seconds per epoch shown in the log.
