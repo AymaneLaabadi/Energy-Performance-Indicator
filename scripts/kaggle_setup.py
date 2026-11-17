@@ -10,8 +10,6 @@ a run, the output of a previous version of the notebook. The script
 * links ``outputs`` to ``/kaggle/working/outputs``, the only thing kept as the notebook output;
 * copies the frozen split and restores runs found in the inputs (most epochs wins);
 * sets ``sys.path`` and ``PYTHONPATH``, so ``!python -m ipe_prediction.training.train`` works.
-
-With the "GPU T4 x2" accelerator, add ``--ddp`` to train on both GPUs (one process each).
 """
 
 from __future__ import annotations
@@ -84,11 +82,9 @@ def setup() -> None:
 
     import torch
 
-    n_gpu = torch.cuda.device_count()
-    gpu = f"{n_gpu} x {torch.cuda.get_device_name(0)}" if n_gpu else "none (enable a GPU)"
+    gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none (enable a GPU)"
     print(f"python {sys.version.split()[0]} | torch {torch.__version__} | GPU {gpu}")
-    ddp = " --ddp" if n_gpu > 1 else ""
-    print(f"next: !python -m ipe_prediction.training.train --name <run> --epochs <n>{ddp}")
+    print("next: !python -m ipe_prediction.training.train --name <run> --epochs <n>")
 
 
 if __name__ == "__main__":

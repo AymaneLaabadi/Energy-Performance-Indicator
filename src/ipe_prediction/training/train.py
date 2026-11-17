@@ -6,16 +6,11 @@ Usage (from the project root)::
     uv run ipe-train --name gru --model cnn_gru --epochs 30
     uv run ipe-train --name quick --epochs 3 --max-train 50000
     uv run ipe-train --name tcn --resume              # continue a stopped run
-    python -m ipe_prediction.training.train --name tcn --ddp   # all GPUs (Kaggle T4 x2)
 
 Artefacts in ``outputs/runs/<name>/``: ``config.json``, ``model.txt``, ``train.log``,
 ``history.csv`` (one row per epoch), ``best.pt`` (best validation epoch), ``last.pt`` (state to
 resume), and at the end ``metrics_val.csv`` and ``summary.json`` for ``best.pt``.
 The test split is never used here (see ``ipe-evaluate``).
-
-``--ddp`` starts one process per visible GPU (DistributedDataParallel). ``batch_size`` stays the
-global batch (split across the GPUs), so a run gives the same kind of result with or without it
-and can be resumed either way. Every process scores the validation set; process 0 logs and saves.
 """
 
 from __future__ import annotations
@@ -24,27 +19,31 @@ import argparse
 import json
 import logging
 import math
-import os
 import time
 from collections.abc import Sequence
 from pathlib import Path
 
 import pandas as pd
 import torch
-import torch.distributed as dist
 from torch import nn
-from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DistributedSampler
 
 from ipe_prediction.data import TARGET_NAMES
 from ipe_prediction.training.config import DataConfig, ExperimentConfig, TrainConfig
 from ipe_prediction.training.dataset import (
     SimulationTensors,
     ThermalDataset,
+    excitation_mask,
     make_dataloader,
     prepare_data,
 )
-from ipe_prediction.training.engine import amp_dtype, evaluate, train_one_epoch, warmup_cosine
+from ipe_prediction.training.engine import (
+    amp_dtype,
+    evaluate,
+    lr_scheduler,
+    recalibrate_batchnorm,
+    train_one_epoch,
+)
+from ipe_prediction.training.losses import LOSSES, n_network_outputs
 from ipe_prediction.training.metrics import constraint_report, per_family_metrics
 from ipe_prediction.training.models import MODELS, build_model, count_parameters
 from ipe_prediction.training.preprocessing import Preprocessor, n_inputs
@@ -60,13 +59,6 @@ def subset(indices: torch.Tensor, n: int | None, seed: int) -> torch.Tensor:
         return indices
     perm = torch.randperm(len(indices), generator=torch.Generator().manual_seed(seed))
     return indices[perm[:n]].sort().values
-
-
-def _rank_and_world() -> tuple[int, int]:
-    """Process rank and number of processes (0, 1 without DDP)."""
-    if dist.is_initialized():
-        return dist.get_rank(), dist.get_world_size()
-    return 0, 1
 
 
 def run(
@@ -87,8 +79,6 @@ def run(
     run_dir = cfg.run_dir
     if (run_dir / "last.pt").exists() and not resume:
         raise FileExistsError(f"{run_dir} already holds a run: resume it or use another name")
-    if _rank_and_world()[0] != 0:  # DDP: only process 0 logs and writes
-        return _train(cfg, model, resume, data)
     run_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     log_file = logging.FileHandler(run_dir / "train.log", mode="a" if resume else "w")
@@ -103,33 +93,44 @@ def run(
 
 def _train(cfg: ExperimentConfig, model: nn.Module | None, resume: bool, data: Data | None) -> dict:
     tc, run_dir = cfg.train, cfg.run_dir
-    rank, world = _rank_and_world()
-    main_process = rank == 0
-    if tc.batch_size % world:
-        raise ValueError(f"batch_size {tc.batch_size} must be divisible by {world} GPUs")
     torch.manual_seed(tc.seed)
     device = torch.device(tc.device if torch.cuda.is_available() else "cpu")
 
     # --- data (seeded subsets: a resumed run sees the same simulations)
     tensors, split = data if data is not None else prepare_data(cfg.data)
-    train_idx = subset(split["train"], cfg.data.max_train, tc.seed)
-    val_idx = subset(split["val"], cfg.data.val_subset, tc.seed + 1)
-    prep = Preprocessor.fit(tensors.delta_t, tensors.targets, train_idx, cfg.data.extra_features)
-    prep = prep.to(device)
+    train_idx, val_idx = split["train"], split["val"]
+    if cfg.data.min_duty_cycle > 0 or cfg.data.min_step_hours > 0:  # input-based filter
+        keep = excitation_mask(tensors.heater_on, cfg.data.min_duty_cycle, cfg.data.min_step_hours)
+        train_idx, val_idx = train_idx[keep[train_idx]], val_idx[keep[val_idx]]
+        logger.info(
+            "excitation filter (duty >= %g, mean step >= %g h): %d train, %d val simulations",
+            cfg.data.min_duty_cycle, cfg.data.min_step_hours, len(train_idx), len(val_idx),
+        )  # fmt: skip
+    train_idx = subset(train_idx, cfg.data.max_train, tc.seed)
+    val_idx = subset(val_idx, cfg.data.val_subset, tc.seed + 1)
+    prep = Preprocessor.fit(
+        tensors.delta_t, tensors.targets, train_idx, cfg.data.extra_features, cfg.data.targets
+    ).to(device)
+    names = prep.target_names
     train_set = ThermalDataset(tensors, train_idx, cfg.data.temperature_noise_std)
-    # each process reads its own shard; the shuffle depends on (seed, epoch) only
-    sampler = DistributedSampler(train_set, num_replicas=world, rank=rank, seed=tc.seed)
-    train_loader = make_dataloader(train_set, tc.batch_size // world, sampler=sampler)
+    train_loader = make_dataloader(train_set, tc.batch_size, shuffle=True, seed=tc.seed)
+    bn_loader = make_dataloader(train_set, tc.batch_size, shuffle=True, seed=tc.seed + 1)
     val_loader = make_dataloader(ThermalDataset(tensors, val_idx), tc.eval_batch_size)
 
     # --- model and optimisation
     if model is None:
-        model = build_model(cfg.model, cfg.model_config, n_inputs(cfg.data.extra_features))
+        in_channels = n_inputs(cfg.data.extra_features)
+        n_out = n_network_outputs(prep, tc.loss)
+        model = build_model(cfg.model, cfg.model_config, in_channels, n_out)
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=tc.lr, weight_decay=tc.weight_decay)
     steps = len(train_loader)
-    scheduler = warmup_cosine(
-        optimizer, tc.epochs * steps, round(tc.warmup_epochs * steps), tc.min_lr / tc.lr
+    scheduler = lr_scheduler(
+        optimizer,
+        tc.lr_schedule,
+        tc.epochs * steps,
+        round(tc.warmup_epochs * steps),
+        tc.min_lr / tc.lr,
     )
     dtype = amp_dtype(device, tc.amp)
     grad_scaler = torch.amp.GradScaler("cuda", enabled=dtype == torch.float16)
@@ -146,46 +147,37 @@ def _train(cfg: ExperimentConfig, model: nn.Module | None, resume: bool, data: D
         logger.info(
             "resumed after epoch %d (best %d, val %.4f)", ckpt["epoch"], best_epoch, best_val
         )
-    elif main_process:
+    else:
         cfg.save(run_dir / "config.json")
         (run_dir / "model.txt").write_text(str(model))
 
     logger.info(
-        "%s: %s parameters | train %d | val %d | batch %d%s | %s | lr %.1e, warmup %.1f epochs",
+        "%s: %s parameters | train %d | val %d | batch %d | %s | lr %s %.1e -> %.1e after %.1f "
+        "epochs | weight decay %g",
         cfg.model,
         f"{count_parameters(model):,}",
         len(train_idx),
         len(val_idx),
         tc.batch_size,
-        f" ({world} GPUs x {tc.batch_size // world})" if world > 1 else "",
         str(dtype).replace("torch.", "autocast ") if dtype else "float32",
+        tc.lr_schedule,
         tc.lr,
+        tc.min_lr,
         tc.warmup_epochs,
+        tc.weight_decay,
     )
-    # DDP synchronises the gradients; ``model`` stays the plain network (eval, checkpoints)
-    trained = DistributedDataParallel(model) if world > 1 else model
 
     # --- epochs
     for epoch in range(start_epoch, tc.epochs + 1):
         t0 = time.time()
-        sampler.set_epoch(epoch)
+        train_loader.generator.manual_seed(tc.seed * 100_003 + epoch)  # same order when resuming
         train_loss = train_one_epoch(
-            trained, prep, train_loader, optimizer, scheduler, grad_scaler, device, dtype,
-            tc.grad_clip,
+            model, prep, train_loader, optimizer, scheduler, grad_scaler, device, dtype,
+            tc.grad_clip, tc.loss,
         )  # fmt: skip
-        if world > 1:  # mean over the shards of all processes
-            loss = torch.tensor(train_loss, device=device)
-            dist.all_reduce(loss, op=dist.ReduceOp.AVG)
-            train_loss = loss.item()
-        val = evaluate(model, prep, val_loader, device, dtype)
-        if val["loss"] < best_val:
-            best_val, best_epoch = val["loss"], epoch
-            if main_process:
-                best = {"model": model.state_dict(), "preprocessor": prep.state_dict()}
-                torch.save(best | {"epoch": epoch}, run_dir / "best.pt")
-        if not main_process:
-            continue
-
+        bn_loader.generator.manual_seed(tc.seed * 100_003 + epoch + 1)
+        recalibrate_batchnorm(model, prep, bn_loader, device, dtype, tc.bn_recalibration_batches)
+        val = evaluate(model, prep, val_loader, device, dtype, tc.loss)
         row = {
             "epoch": epoch,
             "train_loss": train_loss,
@@ -194,9 +186,9 @@ def _train(cfg: ExperimentConfig, model: nn.Module | None, resume: bool, data: D
             "lr": optimizer.param_groups[0]["lr"],
             **{
                 f"val_loss_{n}": float(v)
-                for n, v in zip(TARGET_NAMES, val["loss_per_target"], strict=True)
+                for n, v in zip(names, val["loss_per_target"], strict=True)
             },
-            **{f"val_MAPE_{n}": float(val["metrics"].loc[n, "MAPE_%"]) for n in TARGET_NAMES},
+            **{f"val_MAPE_{n}": float(val["metrics"].loc[n, "MAPE_%"]) for n in names},
         }
         history.append(row)
         logger.info(
@@ -204,10 +196,17 @@ def _train(cfg: ExperimentConfig, model: nn.Module | None, resume: bool, data: D
             epoch,
             train_loss,
             val["loss"],
-            " ".join(f"{n}={row[f'val_MAPE_{n}']:.2f}" for n in TARGET_NAMES),
+            " ".join(f"{n}={row[f'val_MAPE_{n}']:.2f}" for n in names),
             row["seconds"],
             row["lr"],
         )
+
+        if val["loss"] < best_val:
+            best_val, best_epoch = val["loss"], epoch
+            torch.save(
+                {"model": model.state_dict(), "preprocessor": prep.state_dict(), "epoch": epoch},
+                run_dir / "best.pt",
+            )
         pd.DataFrame(history).to_csv(run_dir / "history.csv", index=False)
         torch.save(
             {
@@ -221,18 +220,16 @@ def _train(cfg: ExperimentConfig, model: nn.Module | None, resume: bool, data: D
             },
             run_dir / "last.pt",
         )
-    if not main_process:
-        return {}
 
     # --- final validation of the best epoch
     model.load_state_dict(torch.load(run_dir / "best.pt", weights_only=True)["model"])
-    val = evaluate(model, prep, val_loader, device, dtype)
+    val = evaluate(model, prep, val_loader, device, dtype, tc.loss)
     val["metrics"].to_csv(run_dir / "metrics_val.csv")
     summary = {
         "best_epoch": best_epoch,
         "val_loss": val["loss"],
         "val_family": per_family_metrics(val["metrics"]).round(4).to_dict(orient="index"),
-        "val_constraints": constraint_report(val["pred"]),
+        "val_constraints": constraint_report(val["pred"], names),
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     logger.info(
@@ -241,58 +238,68 @@ def _train(cfg: ExperimentConfig, model: nn.Module | None, resume: bool, data: D
     return summary
 
 
-def _ddp_worker(rank: int, world: int, cfg: ExperimentConfig, resume: bool) -> None:
-    """One DDP process per GPU (started by :func:`main` with ``--ddp``)."""
-    backend = "nccl" if dist.is_nccl_available() else "gloo"
-    dist.init_process_group(backend, rank=rank, world_size=world)
-    torch.cuda.set_device(rank)
-    if rank != 0:
-        logging.getLogger("ipe_prediction").setLevel(logging.WARNING)
-    try:
-        run(cfg, resume=resume)
-    finally:
-        dist.destroy_process_group()
-
-
-def parse_args(argv: Sequence[str] | None = None) -> tuple[ExperimentConfig, bool, bool]:
-    """Configuration (or the saved one with ``--resume``), ``resume`` and ``ddp`` flags."""
+def parse_args(argv: Sequence[str] | None = None) -> tuple[ExperimentConfig, bool]:
+    """Configuration from the command line (or the saved one with ``--resume``)."""
     t = TrainConfig()
     p = argparse.ArgumentParser(description="Train a model (train / validation splits only).")
     p.add_argument("--name", required=True, help="run name: outputs/runs/<name>")
     p.add_argument("--model", default="tcn_attn", choices=sorted(MODELS))
     p.add_argument("--resume", action="store_true", help="continue run <name> from last.pt")
     p.add_argument("--epochs", type=int, default=t.epochs)
-    p.add_argument("--batch-size", type=int, default=t.batch_size, help="global batch size")
-    p.add_argument("--lr", type=float, default=t.lr)
+    p.add_argument("--batch-size", type=int, default=t.batch_size)
+    p.add_argument("--lr-schedule", choices=["step", "cosine"], default=t.lr_schedule)
+    p.add_argument("--lr", type=float, default=t.lr, help="lr of the first warmup epochs")
+    p.add_argument("--min-lr", type=float, default=t.min_lr, help="lr after the warmup (step)")
+    p.add_argument("--warmup-epochs", type=float, default=t.warmup_epochs)
+    p.add_argument("--weight-decay", type=float, default=t.weight_decay)
+    p.add_argument(
+        "--loss", choices=LOSSES, default=t.loss, help="gaussian_nll: also predict a variance"
+    )
     p.add_argument("--max-train", type=int, help="subsample the training split (quick runs)")
+    p.add_argument("--min-duty-cycle", type=float, default=0.0, help="input filter (0 = off)")
+    p.add_argument("--min-step-hours", type=float, default=0.0, help="input filter (0 = off)")
+    p.add_argument(
+        "--targets",
+        nargs="+",
+        choices=TARGET_NAMES,
+        default=list(TARGET_NAMES),
+        help="targets to learn (HLC = mit + ext only when all three are given)",
+    )
     p.add_argument("--extra-features", action="store_true", help="5 input channels instead of 2")
     p.add_argument("--no-amp", dest="amp", action="store_false", help="train in float32")
-    p.add_argument("--ddp", action="store_true", help="use all visible GPUs (Kaggle T4 x2)")
     a = p.parse_args(argv)
 
     if a.resume:
-        return ExperimentConfig.load(Path(ExperimentConfig.output_dir) / a.name), True, a.ddp
+        return ExperimentConfig.load(Path(ExperimentConfig.output_dir) / a.name), True
     cfg = ExperimentConfig(
         name=a.name,
         model=a.model,
-        data=DataConfig(max_train=a.max_train, extra_features=a.extra_features),
-        train=TrainConfig(epochs=a.epochs, batch_size=a.batch_size, lr=a.lr, amp=a.amp),
+        data=DataConfig(
+            max_train=a.max_train,
+            extra_features=a.extra_features,
+            targets=tuple(a.targets),
+            min_duty_cycle=a.min_duty_cycle,
+            min_step_hours=a.min_step_hours,
+        ),
+        train=TrainConfig(
+            epochs=a.epochs,
+            batch_size=a.batch_size,
+            lr_schedule=a.lr_schedule,
+            lr=a.lr,
+            min_lr=a.min_lr,
+            warmup_epochs=a.warmup_epochs,
+            weight_decay=a.weight_decay,
+            loss=a.loss,
+            amp=a.amp,
+        ),
     )
-    return cfg, False, a.ddp
+    return cfg, False
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     """CLI entry point (``uv run ipe-train``)."""
-    cfg, resume, ddp = parse_args(argv)
-    if not ddp:
-        run(cfg, resume=resume)
-        return
-    world = torch.cuda.device_count()
-    if world < 1:
-        raise SystemExit("--ddp needs at least one GPU")
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29500")
-    torch.multiprocessing.spawn(_ddp_worker, args=(world, cfg, resume), nprocs=world)
+    cfg, resume = parse_args(argv)
+    run(cfg, resume=resume)
 
 
 if __name__ == "__main__":

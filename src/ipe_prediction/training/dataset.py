@@ -17,7 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset
 
 from ipe_prediction.data import (
     POWER_DECIMALS,
@@ -123,6 +123,24 @@ def prepare_data(cfg: DataConfig) -> tuple[SimulationTensors, dict[str, torch.Te
     return tensors, split
 
 
+def excitation_mask(
+    heater_on: torch.Tensor, min_duty_cycle: float, min_step_hours: float, chunk: int = 100_000
+) -> torch.Tensor:
+    """Simulations whose heating input passes the filter ``(N,)`` bool (input-only criteria).
+
+    * duty cycle: share of time with the heater on;
+    * mean step: series duration divided by the number of constant on/off blocks (8 h for a
+      constant input).
+    """
+    keep = []
+    for block in heater_on.split(chunk):
+        u = block.float()
+        hours = u.shape[1] / 60
+        mean_step = hours / (u.diff(dim=1).abs().sum(1) + 1)
+        keep.append((u.mean(1) >= min_duty_cycle) & (mean_step >= min_step_hours))
+    return torch.cat(keep)
+
+
 class ThermalDataset(Dataset[dict[str, torch.Tensor]]):
     """Dataset over a subset (``indices``) of :class:`SimulationTensors`.
 
@@ -170,13 +188,15 @@ def _passthrough(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 def make_dataloader(
     dataset: ThermalDataset,
     batch_size: int,
-    sampler: Sampler[int] | None = None,
+    shuffle: bool = False,
+    seed: int = 0,
 ) -> DataLoader[dict[str, torch.Tensor]]:
-    """``DataLoader`` with batched fetching; in order unless a ``sampler`` (e.g. shuffling) is given."""
+    """``DataLoader`` with batched fetching and a seeded shuffle (``loader.generator``)."""
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        sampler=sampler,
+        shuffle=shuffle,
         collate_fn=_passthrough,
         pin_memory=torch.cuda.is_available(),
+        generator=torch.Generator().manual_seed(seed),
     )
