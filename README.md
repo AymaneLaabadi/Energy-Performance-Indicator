@@ -8,24 +8,86 @@ using 1,000,000 dynamic thermal simulations of `quentin_house` (coEnergy assessm
 (problem, data analysis, methodological choices, results, limits). The other notebooks hold the
 detailed analyses it summarises.
 
-## Main results (validation split, 100k simulations)
+## Main results (test split, 100k simulations, scored once)
 
 Final model: dilated residual TCN with attention pooling (186k parameters), trained on the 800k
-training simulations (`final_tcn_mse`). Standardised MSE 0.734 (1.0 = predicting the training mean).
+training simulations (`final_tcn_mse`). Standardised MSE 0.731 on test, 0.734 on validation
+(1.0 = predicting the training mean): the choices made on validation did not overfit it.
 
 | Indicator | MAPE | P95 APE | R² |
 |---|---|---|---|
-| HLC | 8.3 % | 21.0 % | 0.42 |
-| HLC_ext | 9.6 % | 24.2 % | 0.42 |
-| HLC_mit | 15.9 % | 42.4 % | 0.27 |
-| tau_n | 12.2 % | 29.6 % | 0.24 |
-| tau_b | 14.9 % | 36.6 % | 0.11 |
-| tau_inf | 17.9 % | 44.1 % | 0.09 |
+| HLC | 8.3 % | 20.9 % | 0.42 |
+| HLC_ext | 9.7 % | 24.5 % | 0.42 |
+| HLC_mit | 15.8 % | 41.8 % | 0.27 |
+| tau_n | 12.2 % | 29.6 % | 0.25 |
+| tau_b | 14.8 % | 36.3 % | 0.11 |
+| tau_inf | 17.9 % | 44.0 % | 0.09 |
 
 The plateau is an **identifiability limit of 8 h tests**, not a modelling one: under heating the
 curve is almost entirely determined by the building, but different buildings give near-identical
 curves. The test measures very well an effective heat capacity `C_n = HLC x tau_n`
 (R² 0.84) and much less how it splits into heat losses and time constants (notebooks 04, 06).
+
+## The project in 9 slides
+
+Built by `scripts/make_readme_figures.py` (numbers from the notebooks, curves from the data).
+
+**1. The problem.** An 8 h test gives the indoor temperature response to an on/off heater; the
+six indicators describe how fast the building loses heat (`HLC`, split into adjoining spaces and
+outside) and how slowly it responds (three time constants).
+
+![The problem](docs/figures/01_problem.png)
+
+**2. The data.** One million clean simulations, but only 2,798 distinct heating sequences: the
+same protocols repeat, which later serves as a controlled experiment.
+
+![The data](docs/figures/02_data.png)
+
+**3. Our approach.** A dilated TCN with attention pooling on the raw curve; `HLC` is computed as
+`HLC_mit + HLC_ext` so the physical constraint holds exactly; stratified frozen split.
+
+![Approach](docs/figures/03_approach.png)
+
+**4. Results.** `HLC` within 8.3 % on average, `HLC_ext` 9.6 %; the slow time constants are barely
+better than the population mean, while the effective capacity `C_n = HLC x tau_n` reaches R² 0.84.
+
+![Results](docs/figures/04_results.png)
+
+**5. The models do not fit the data.** Training loss = validation loss, every architecture and
+input variant stops at the same level, and on 1,024 samples the real labels are memorised barely
+faster than shuffled ones, while a label computed from the curve is learned at once.
+
+![Plateau](docs/figures/05_plateau.png)
+
+**6. Why: an identifiability limit.** With the same heating, two buildings with HLC 203 and
+307 W/K give the same curve. Curve twins differ in their targets almost as much as random pairs,
+except for `C_n`: the test measures the stored heat, not how it splits into losses and inertia.
+
+![Identifiability](docs/figures/06_identifiability.png)
+
+**7. The best excitation.** Always heat; heat 55-65 % of the time with long on/off steps
+(1.3-4 h), avoid fast switching; `C_n` is measured in 2-3 h but `HLC` and the time constants still
+gain information at 8 h, so a longer test helps them.
+
+![Excitation](docs/figures/07_excitation.png)
+
+**8. The best excitation, and the paper.** We recommend always heating, 55-65 % of the time, with
+on/off steps of 1.3-4 h, and testing longer than 8 h when HLC and the time constants matter.
+The paper behind the assessment (Nassif, Guernouti, Stabat & Cohen,
+[SSRN 6928008](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6928008)) chooses the
+excitation offline in the same spirit: a k-NN surrogate of the HLC error over the generator
+settings (power, switching probability, minimum duration), minimised by Bayesian optimisation.
+On the HAMEX test cell it recovers HLC within 2 W/K of a 14-day co-heating reference in 6 to
+24 h (Table 5), and its 1,600 simulated campaigns show more stable HLC with longer windows, as
+on our data. It predicts HLC only and lists other indicators as future work; we map error and
+information per setting for six indicators and show what an 8 h test can identify (`C_n`) and
+what it cannot.
+
+![Best excitation and the paper](docs/figures/08_paper.png)
+
+**9. Conclusions and recommendations for the measurement protocol.**
+
+![Conclusions](docs/figures/09_conclusion.png)
 
 ## Setup
 
@@ -46,7 +108,8 @@ uv run ipe-evaluate --run outputs/runs/final_tcn_mse --split val
 uv run ipe-evaluate --run outputs/runs/final_tcn_mse --split test    # once, at the very end
 ```
 
-About 1 min per epoch on an RTX 3070 (bf16), 30 epochs. Then run the notebooks.
+About 1 min per epoch on an RTX 3070 (bf16), 30 epochs. Then run the notebooks, and
+`uv run python scripts/make_readme_figures.py` for the slides above.
 
 | Notebook | Content |
 |---|---|
@@ -88,6 +151,7 @@ src/ipe_prediction/
     quality.py          raw-file scan, curve anomalies, group outliers, duplicates
 scripts/
   kaggle_pack.py, kaggle_setup.py   train on a Kaggle GPU (see below)
+  make_readme_figures.py            the summary slides of this README (docs/figures/)
 notebooks/              see the table above
 ```
 
@@ -116,11 +180,9 @@ Training options: `uv run ipe-train --help` (`--model`, `--epochs`, `--lr`, `--l
 
 ## Branches
 
-* `main`: the simple single-GPU pipeline.
-* `model-a`: this work (Model A, targets selection, beta-NLL, input filter, analysis notebooks).
-* `sysid-hybrid`: system-identification features + TCN hybrid (tested, no gain; notebook in report).
-* `kaggle-ddp`: `main` + multi-GPU training (DistributedDataParallel, Kaggle T4 x2), learning-rate
-  restarts and the overfitting run (below).
+* `main`: the final pipeline on one GPU, the analysis notebooks and the report.
+* `kaggle-ddp` (this branch): the same, plus multi-GPU training (DistributedDataParallel) for the
+  Kaggle T4 x2 accelerator, learning-rate restarts and the overfitting run (below).
 
 ## Training on Kaggle (free GPU)
 
