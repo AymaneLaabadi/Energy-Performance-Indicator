@@ -180,10 +180,9 @@ Training options: `uv run ipe-train --help` (`--model`, `--epochs`, `--lr`, `--l
 
 ## Branches
 
-* `main`: the simple single-GPU pipeline.
-* `model-a`: this work (Model A, targets selection, beta-NLL, input filter, analysis notebooks).
-* `sysid-hybrid`: system-identification features + TCN hybrid (tested, no gain; notebook in report).
-* `kaggle-ddp`: multi-GPU training (DistributedDataParallel) for the Kaggle T4 x2 accelerator.
+* `main`: the final pipeline on one GPU, the analysis notebooks and the report.
+* `kaggle-ddp`: the same, plus multi-GPU training (DistributedDataParallel) for the Kaggle
+  T4 x2 accelerator.
 
 ## Training on Kaggle (free GPU)
 
