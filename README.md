@@ -2,7 +2,7 @@
 
 Predict six intrinsic thermal indicators of a building (`HLC`, `HLC_mit`, `HLC_ext`, `tau_b`,
 `tau_n`, `tau_inf`) from 8 hours of indoor air temperature `Tint(t)` and heating power `U(t)`,
-using 1,000,000 dynamic thermal simulations of `quentin_house` (coEnergy assessment).
+using 1,000,000 dynamic thermal simulations of `quentin_house`.
 
 **Start with [`notebooks/00_report.ipynb`](notebooks/00_report.ipynb)**: the executable report
 (problem, data analysis, methodological choices, results, limits). The other notebooks hold the
